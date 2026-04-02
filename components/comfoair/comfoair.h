@@ -16,6 +16,22 @@ namespace esphome
   namespace comfoair
   {
 
+    // These are the possible status of the two receive functions for CA and CS
+    typedef enum
+    {
+      RX_STATUS_DEFAULT,                     // default (should not happen. coding error?)
+      RX_STATUS_RECEIVED_ACK,                // ACK received
+      RX_STATUS_RECEIVED_MESSAGE,            // message received
+      RX_STATUS_RECEIVED_INVALID_MESSAGE,    // invalid message received (rx error)
+      RX_STATUS_RECEIVED_START_OF_MESSAGE,   // found rx-Start and adjusted buffer accordingly (just 4 info. no error.)
+      RX_STATUS_WRAPPED_BUFFER_INDEX         // wrapped buffer index (just 4 info. no error.)
+    } rx_status;
+
+    static const uint8_t COMFOAIR_MIN_SUPPORTED_TEMP  = 12;
+    static const uint8_t COMFOAIR_MAX_SUPPORTED_TEMP  = 29;
+    static const float   COMFOAIR_SUPPORTED_TEMP_STEP = 0.5f;
+    static const uint8_t MAX_MESSAGE_SIZE = 70U;
+
     static const char *TAG = "comfoair";
 
     class ComfoAirComponent;
@@ -37,32 +53,35 @@ namespace esphome
       friend class ComfoAirSizeSelect;
 
     public:
-      // Poll every 600ms
+
+      // Poll every 2000ms (previously 600ms)
       ComfoAirComponent() : Climate(),
-                            PollingComponent(600),
+                            PollingComponent(2000),
                             UARTDevice() {}
 
-      /// Return the traits of this controller.
+      // Return the traits of this controller.
       climate::ClimateTraits traits() override
       {
         auto traits = climate::ClimateTraits();
-    traits.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
+        traits.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
         traits.set_supported_modes({climate::CLIMATE_MODE_FAN_ONLY});
-    traits.clear_feature_flags(climate::CLIMATE_REQUIRES_TWO_POINT_TARGET_TEMPERATURE);
-    traits.clear_feature_flags(climate::CLIMATE_SUPPORTS_ACTION);
-        traits.set_visual_min_temperature(12);
-        traits.set_visual_max_temperature(29);
-        traits.set_visual_temperature_step(1);
-    traits.set_supported_fan_modes({
-      climate::CLIMATE_FAN_LOW,
-      climate::CLIMATE_FAN_MEDIUM,
-      climate::CLIMATE_FAN_HIGH,
-      climate::CLIMATE_FAN_OFF,
-    });
+        traits.clear_feature_flags(climate::CLIMATE_REQUIRES_TWO_POINT_TARGET_TEMPERATURE);
+        traits.set_supported_presets({climate::CLIMATE_PRESET_HOME});
+        traits.clear_feature_flags(climate::CLIMATE_SUPPORTS_ACTION);
+        traits.set_visual_min_temperature(COMFOAIR_MIN_SUPPORTED_TEMP);
+        traits.set_visual_max_temperature(COMFOAIR_MAX_SUPPORTED_TEMP);
+        traits.set_visual_temperature_step(COMFOAIR_SUPPORTED_TEMP_STEP);
+        traits.set_supported_fan_modes({
+          climate::CLIMATE_FAN_AUTO,
+          climate::CLIMATE_FAN_LOW,
+          climate::CLIMATE_FAN_MEDIUM,
+          climate::CLIMATE_FAN_HIGH,
+          climate::CLIMATE_FAN_OFF,
+        });
         return traits;
       }
 
-      /// Override control to change settings of the climate device.
+      // Override control to change settings of the climate device.
       void control(const climate::ClimateCall &call) override
       {
         if (call.get_fan_mode().has_value())
@@ -84,11 +103,14 @@ namespace esphome
           case climate::CLIMATE_FAN_OFF:
             level = 0x01;
             break;
-        case climate::CLIMATE_FAN_ON:
-        case climate::CLIMATE_FAN_MIDDLE:
-        case climate::CLIMATE_FAN_DIFFUSE:
-        default:
-          level = -1;
+          case climate::CLIMATE_FAN_AUTO:
+            level = 0x00;
+            break;
+          case climate::CLIMATE_FAN_ON:
+          case climate::CLIMATE_FAN_MIDDLE:
+          case climate::CLIMATE_FAN_DIFFUSE:
+          default:
+            level = -1;
             break;
           }
 
@@ -131,6 +153,7 @@ namespace esphome
 
       void update() override
       {
+        ESP_LOGD(TAG, "Component update: %d", update_counter_);
         switch (update_counter_)
         {
         case -4:
@@ -175,55 +198,97 @@ namespace esphome
         case 9:
           get_time_delay_();
           break;
+        default:
+          ESP_LOGI(TAG, "Component update: %d", update_counter_);
+          break;
         }
 
         update_counter_++;
-        if (update_counter_ > num_update_counter_elements_)
+        if (update_counter_ > 9) // num_update_counter_elements_
+        {
           update_counter_ = 0;
+        }
       }
 
       void loop() override
       {
+        /*
+        TX:
+        1. Build TX-array:
+          - 2 Byte Command
+          - 1 Byte Size = amount of data bytes (0...n)
+          - 0...n data bytes = payload data (without doubled 0x07 bytes yet)
+        2. Calculate and append checksum across TX-array.
+        3. transmit function:
+          - transmit 2 Byte "START" (0x07 0xF0)
+          - transmit TX-array
+            - transmit byte 1 to byte 3
+            - transmit byte 4 to byte [3.byte + 3] while transmitting each 0x07 twice.
+            - transmit byte [3.byte + 4].
+          - transmit 2 Byte "STOP" (0x07 0x0F)
+
+        RX:
+        1. read uart byte by byte into RX-array
+          - search for ACK (0x07 0xF3) -> announce new ACK
+          - search for START (0x07 0xF0) and STOP (0x07 0x0F) -> announce new message
+        2. remove START, STOP and doubled 0x07 from new RX-array to get clean data.
+        3. calculate and verify checksum of new message.
+          - send ACK?
+        4. process RX data
+        */
+
+        // CA350
+        // caRxSerial();       // receive ACKs and messages from CA350
+
         while (available() != 0)
         {
-          read_byte(&data_[data_index_]);
-          auto check = check_byte_();
-          if (!check.has_value())
-          {
+          uint8_t rx_byte_u8;
 
-            // finished
-            if (data_[COMMAND_ID_ACK] != COMMAND_ACK)
-            {
-              parse_data_();
-            }
-            data_index_ = 0;
-          }
-          else if (!*check)
+          // fetch byte for RX buffer and process it by readRx()
+          read_byte(&rx_byte_u8);
+
+          switch (checkRx_(caRxBuffer_au8, &caRxIdx_u8, rx_byte_u8))
           {
-            // wrong data
-            ESP_LOGV(TAG, "Byte %i of received data frame is invalid.", data_index_);
-            data_index_ = 0;
-          }
-          else
-          {
-            // next byte
-            data_index_++;
+          case RX_STATUS_DEFAULT:
+            break;
+          case RX_STATUS_RECEIVED_ACK:
+            ESP_LOGVV(TAG, "RX: ACK");
+            // caProcessNewACK(); // do something if an ACK is received
+            break;
+          case RX_STATUS_RECEIVED_MESSAGE:
+            ESP_LOGVV(TAG, "RX: message cmd: %02X", caRxBuffer_au8[1]);
+            // acknowledge message
+            txACK_();
+            // at this point caRxBuffer_au8 consists of
+            // 2-byte command, length, data and checksum.
+            // caProcessNewData(caRxBuffer); // do something with received message
+            parseRxMessage_(caRxBuffer_au8);
+            break;
+          case RX_STATUS_RECEIVED_INVALID_MESSAGE:
+            ESP_LOGW(TAG, "RX: Invalid checksum (from CA350).");
+            break;
+          case RX_STATUS_RECEIVED_START_OF_MESSAGE:
+          case RX_STATUS_WRAPPED_BUFFER_INDEX:
+          default:
+            break;
           }
         }
+
+        // ComfoSense
+        // csRxSerial();       // receive ACKs and messages from ComfoSense
+
       }
 
       float get_setup_priority() const override { return setup_priority::DATA; }
 
-      void error_reset(void)
+      void reset_errors(void)
       {
-        uint8_t reset_cmd[4] = {1, 0, 0, 0};
-        write_command_(CMD_RESET_AND_SELF_TEST, reset_cmd, sizeof(reset_cmd));
+        reset_errors_(false, true);
       }
 
-      void filter_reset(void)
+      void reset_filters(void)
       {
-        uint8_t reset_cmd[4] = {0, 0, 0, 1};
-        write_command_(CMD_RESET_AND_SELF_TEST, reset_cmd, sizeof(reset_cmd));
+        reset_errors_(true, false);
       }
 
       void set_name(const char *value) { name = value; }
@@ -236,10 +301,28 @@ namespace esphome
       bool set_unit_size(uint8_t raw_size);
       void set_size_select(ComfoAirSizeSelect *size_select);
 
+      void set_level(int level)
+      {
+        set_level_(level);
+      }
+      void set_comfort_temperature(float temperature)
+      {
+        void set_comfort_temperature_(float temperature);
+      }
+
     protected:
+
+      // --- setter ---
+      
+      void reset_errors_(bool filters, bool errors)
+      {
+        uint8_t reset_cmd[CMD_RESET_AND_SELF_TEST_LENGTH] = {errors ? (uint8_t)1 : (uint8_t)0, 0, 0, filters ? (uint8_t)1 : (uint8_t)0};
+        write_command_(CMD_RESET_AND_SELF_TEST, reset_cmd, sizeof(reset_cmd));
+      }
+
       void set_level_(int level)
       {
-        if (level < 0 || level > 5)
+        if (level < 0 || level > 4)
         {
           ESP_LOGI(TAG, "Ignoring invalid level request: %i", level);
           return;
@@ -247,14 +330,15 @@ namespace esphome
 
         ESP_LOGI(TAG, "Setting level to: %i", level);
         {
-          uint8_t command[1] = {(uint8_t)level};
+          uint8_t command[CMD_SET_LEVEL_LENGTH] = {(uint8_t) level};
           write_command_(CMD_SET_LEVEL, command, sizeof(command));
         }
       }
 
       void set_comfort_temperature_(float temperature)
       {
-        if (temperature < 12.0f || temperature > 29.0f)
+        if (temperature < COMFOAIR_MIN_SUPPORTED_TEMP
+         || temperature > COMFOAIR_MAX_SUPPORTED_TEMP)
         {
           ESP_LOGI(TAG, "Ignoring invalid temperature request: %i", temperature);
           return;
@@ -262,680 +346,822 @@ namespace esphome
 
         ESP_LOGI(TAG, "Setting temperature to: %i", temperature);
         {
-          uint8_t command[1] = {(uint8_t)((temperature + 20.0f) * 2.0f)};
+          uint8_t command[CMD_SET_COMFORT_TEMPERATURE_LENGTH] = {(uint8_t) ((temperature + 20.0f) * 2.0f)};
           write_command_(CMD_SET_COMFORT_TEMPERATURE, command, sizeof(command));
         }
       }
 
+      // --- TX functions ---
+      
+      // Build TX-array
       void write_command_(const uint8_t command, const uint8_t *command_data, uint8_t command_data_length)
       {
-        write_byte(COMMAND_PREFIX);
-        write_byte(COMMAND_HEAD);
-        write_byte(0x00);
-
-        uint16_t checksum = 173;
-        checksum += command;
-        checksum += command_data_length;
-
-        write_escaped_byte_(command);
-        write_escaped_byte_(command_data_length);
-
-        for (uint8_t i = 0; i < command_data_length; i++)
+        uint8_t message_au8_au8[MAX_MESSAGE_SIZE];
+        message_au8_au8[0] = 0x00;
+        message_au8_au8[1] = command;
+        message_au8_au8[2] = command_data_length;
+        for (uint8_t idx_u8 = 0; idx_u8 < command_data_length; idx_u8++)
         {
-          uint8_t data_byte = command_data[i];
-          checksum += data_byte;
-          write_escaped_byte_(data_byte);
+          message_au8_au8[3 + idx_u8] = command_data[idx_u8];
         }
+        txMessage_(message_au8_au8);
+      }
 
-        uint8_t checksum_byte = static_cast<uint8_t>(checksum & 0xFF);
-        write_escaped_byte_(checksum_byte);
+      // add prefix, second 0x07, checksum and postfix and transmit that data.
+      void txMessage_(uint8_t message_au8[] /*, tx_serial txPort_en */)
+      {
+        // add 2 bytes "START"
+        // copy "COMMAND" and "SIZE"
+        // copy "DATA" and double each 0x07 in data area
+        // add "CHECKSUM"
+        // add 2 bytes "STOP"
+        // transmit everything to Serial
 
-        write_byte(COMMAND_PREFIX);
-        write_byte(COMMAND_TAIL);
+        ESP_LOGVV(TAG, "TX: cmd: %02X size: %02X - %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X", message_au8[1], message_au8[2], message_au8[3], message_au8[4], message_au8[5], message_au8[6], message_au8[7], message_au8[8], message_au8[9], message_au8[10], message_au8[11], message_au8[12], message_au8[13], message_au8[14], message_au8[15], message_au8[16], message_au8[17], message_au8[18], message_au8[19], message_au8[20], message_au8[21], message_au8[22]);
+
+        uint8_t txBuffer_au8[MAX_MESSAGE_SIZE]; // TX buffer
+        // Start
+        txBuffer_au8[0] = 0x07;
+        txBuffer_au8[1] = 0xF0;
+        // Command
+        txBuffer_au8[2] = message_au8[0];
+        txBuffer_au8[3] = message_au8[1];
+        // Size
+        txBuffer_au8[4] = message_au8[2];
+        // Data
+        uint8_t idx_message_u8 = 3U;
+        uint8_t idx_txBuffer_u8 = 5U;
+        while (idx_message_u8 < message_au8[2] + 3)
+        {
+          // copy current byte
+          txBuffer_au8[idx_txBuffer_u8] = message_au8[idx_message_u8];
+          if (message_au8[idx_message_u8] == 0x07U)
+          {
+            // repeat 0x07 in TX
+            idx_txBuffer_u8++;
+            txBuffer_au8[idx_txBuffer_u8] = 0x07U;
+          }
+          idx_message_u8++;
+          idx_txBuffer_u8++;
+        }
+        // Checksum
+        txBuffer_au8[idx_txBuffer_u8] = calcChecksum_(message_au8);
+        idx_txBuffer_u8++;
+        // Stop
+        txBuffer_au8[idx_txBuffer_u8] = 0x07;
+        idx_txBuffer_u8++;
+        txBuffer_au8[idx_txBuffer_u8] = 0x0F;
+
+        // todo for future use when ComfoAir and ComfoSense are both 
+        // connected to an individual UART on this ESP32:
+        // Either send to CA or CS
+        //
+        // transmit
+        // idx_message_u8 = 0U;
+        // switch (txPort_en)
+        // {
+        // case SERIAL_0_PC:
+        //   while (idx_message_u8 <= idx_txBuffer_u8)
+        //   {
+        //     Serial.write(txBuffer_au8[idx_message_u8]);
+        //     idx_message_u8++;
+        //   }
+        //   break;
+        // case SERIAL_1_ComfoAir:
+        //   while (idx_message_u8 <= idx_txBuffer_u8)
+        //   {
+        //     Serial1.write(txBuffer_au8[idx_message_u8]);
+        //     idx_message_u8++;
+        //   }
+        //   break;
+        // case SERIAL_2_ComfoSense:
+        //   while (idx_message_u8 <= idx_txBuffer_u8)
+        //   {
+        //     Serial2.write(txBuffer_au8[idx_message_u8]);
+        //     idx_message_u8++;
+        //   }
+        //   break;
+        // default:
+        //   break;
+        // }
+        idx_txBuffer_u8++;
+        write_array(txBuffer_au8, idx_txBuffer_u8);
         flush();
       }
 
-      void write_escaped_byte_(uint8_t value)
+      void txACK_(/* tx_serial txPort_en */)
       {
-        write_byte(value);
-        if (value == COMMAND_PREFIX)
-        {
-          write_byte(value);
-        }
+        // send an ACK to Serial
+
+        // todo transmit
+        // switch (txPort_en)
+        // {
+        // case SERIAL_0_PC:
+        //   Serial.write(0x07);
+        //   Serial.write(0xF3);
+        //   break;
+        // case SERIAL_1_ComfoAir:
+        //   Serial1.write(0x07);
+        //   Serial1.write(0xF3);
+        //   break;
+        // case SERIAL_2_ComfoSense:
+        //   Serial2.write(0x07);
+        //   Serial2.write(0xF3);
+        //   break;
+        // default:
+        //   break;
+        // }
+
+        write_byte(COMMAND_PREFIX);
+        write_byte(COMMAND_HEAD_ACK);
+        flush();
       }
 
-      uint8_t comfoair_checksum_(uint8_t command, uint8_t length, const uint8_t *command_data) const
+      // RX & TX common checksum function
+      uint8_t calcChecksum_(uint8_t message_au8[])
       {
-        uint16_t sum = 173;
-        sum += command;
-        sum += length;
-        if (command_data != nullptr)
+        // Calculates checksum.
+        // Doubled 0x07 has to be removed beforehand!
+        uint16_t sum = 0xADU; // = 173
+        uint8_t idx = 0U;
+
+        while (idx <= message_au8[2] + 2)
         {
-          for (uint8_t i = 0; i < length; i++)
-          {
-            sum += command_data[i];
-          }
+          // sum up all message bytes including
+          // "Kommando", "Anzahl Daten" and "Daten"
+          sum = sum + message_au8[idx];
+          idx++;
         }
-        return static_cast<uint8_t>(sum & 0xFF);
+
+        // return only LSB of sum
+        return ((uint8_t)sum);
       }
 
-      optional<bool> check_byte_() const
+      // --- RX functions ---
+      
+      rx_status checkRx_(uint8_t rxBuffer[], uint8_t *index_u8, uint8_t rc)
       {
-        uint8_t index = data_index_;
-        uint8_t byte = data_[index];
+        /* Manage and analyze rx bytes.
+          return indicates ACK or MESSAGE.
+        */
+        rx_status return_val = RX_STATUS_DEFAULT;
 
-        if (index == 0)
+        // store received byte in array
+        rxBuffer[*index_u8] = rc;
+
+        // analyze array
+
+        // Two possible message beginnings:
+        // 1. 0x07 0xF3 -> is an ACK
+        // 2. 0x07 0xF0 -> is the beginning of an actual message which has to end with 0x07 0x0F
+
+        if (*index_u8 == 1U
+          && rxBuffer[0] == 0x07
+          && rxBuffer[1] == 0xF3)
         {
-          return byte == COMMAND_PREFIX;
+          // received ACK
+          return_val = RX_STATUS_RECEIVED_ACK;
+          *index_u8 = 0U;
         }
-
-        if (index == 1)
+        else if (*index_u8 > 1U
+              && rxBuffer[*index_u8 - 2] != 0x07
+              && rxBuffer[*index_u8 - 1] == 0x07
+              && rxBuffer[*index_u8] == 0xF3)
         {
-          if (byte == COMMAND_ACK)
+          // received ACK
+          return_val = RX_STATUS_RECEIVED_ACK;
+          *index_u8 = 0U;
+        }
+        else if (*index_u8 > 1U
+              && rxBuffer[*index_u8 - 2] != 0x07
+              && rxBuffer[*index_u8 - 1] == 0x07
+              && rxBuffer[*index_u8] == 0xF0)
+        {
+          // This has to be the start of a new message.
+          //
+          // This assumption is true as long as there is no Kommando 0x.. 0x07
+          // followed by a size of 0xF0. But afaik the Kommando 0x00 0x07 is of
+          // size 3 and other 0x.. 0x07 commands are unknown.
+          rxBuffer[0] = 0x07;
+          rxBuffer[1] = 0xF0;
+          *index_u8 = 2U;
+          return_val = RX_STATUS_RECEIVED_START_OF_MESSAGE;
+        }
+        else if (rxBuffer[0] == 0x07
+              && rxBuffer[1] == 0xF0
+              && rxBuffer[*index_u8 - 1] == 0x07
+              && rxBuffer[*index_u8] == 0x0F)
+        {
+          // new message received:
+          // remove "START" and "STOP" plus
+          // eliminate double 0x07 within data area
+          *index_u8 = isolateRxMessage_(rxBuffer, *index_u8);
+
+          // test checksum
+          if (calcChecksum_(rxBuffer) == rxBuffer[*index_u8])
           {
-            return {};
+            // message is valid
+            return_val = RX_STATUS_RECEIVED_MESSAGE;
+            *index_u8 = 0U;
           }
           else
           {
-            return byte == COMMAND_HEAD;
+            // message invalid
+            return_val = RX_STATUS_RECEIVED_INVALID_MESSAGE;
+            ESP_LOGD(TAG, "RX: Invalid checksum (from CA350): %02X(c) != %02X(rx) (cmd: %02X size: %02X - %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X)", calcChecksum_(rxBuffer), rxBuffer[*index_u8], rxBuffer[1], rxBuffer[2], rxBuffer[3], rxBuffer[4], rxBuffer[5], rxBuffer[6], rxBuffer[7], rxBuffer[8], rxBuffer[9], rxBuffer[10], rxBuffer[11], rxBuffer[12], rxBuffer[13], rxBuffer[14], rxBuffer[15], rxBuffer[16], rxBuffer[17], rxBuffer[18], rxBuffer[19], rxBuffer[20], rxBuffer[21], rxBuffer[22]);
+            *index_u8 = 0U;
           }
         }
-
-        if (index == 2)
+        else
         {
-          return byte == 0x00;
+          return_val = RX_STATUS_WRAPPED_BUFFER_INDEX;
+          *index_u8 = (1 + *index_u8) % MAX_MESSAGE_SIZE;
         }
-
-        if (index < COMMAND_LEN_HEAD)
-        {
-          return true;
-        }
-
-        uint8_t data_length = data_[COMMAND_IDX_DATA];
-
-        if ((COMMAND_LEN_HEAD + data_length + COMMAND_LEN_TAIL) > sizeof(data_))
-        {
-          ESP_LOGW(TAG, "ComfoAir message too large");
-          return false;
-        }
-
-        if (index < COMMAND_LEN_HEAD + data_length)
-        {
-          return true;
-        }
-
-        if (index == COMMAND_LEN_HEAD + data_length)
-        {
-          // checksum is without checksum bytes
-          uint8_t checksum = comfoair_checksum_(
-              data_[COMMAND_IDX_MSG_ID], data_length, data_ + COMMAND_LEN_HEAD);
-          if (checksum != byte)
-          {
-            // ESP_LOGW(TAG, "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X", data_[0], data_[1], data_[2], data_[3], data_[4], data_[5], data_[6], data_[7], data_[8], data_[9], data_[10]);
-            ESP_LOGW(TAG, "ComfoAir Checksum doesn't match: 0x%02X!=0x%02X", byte, checksum);
-            return false;
-          }
-          return true;
-        }
-
-        if (index == COMMAND_LEN_HEAD + data_length + 1)
-        {
-          return byte == COMMAND_PREFIX;
-        }
-
-        if (index == COMMAND_LEN_HEAD + data_length + 2)
-        {
-          if (byte != COMMAND_TAIL)
-          {
-            return false;
-          }
-        }
-
-        return {};
+        return(return_val);
       }
 
-      void parse_data_()
+      uint8_t isolateRxMessage_(uint8_t rxBuffer[], uint8_t size)
+      {
+        // remove "START" (2 bytes)
+        // copy "COMMAND" and "SIZE" (3 bytes)
+        // copy "DATA" while removing doubled 0x07 in data area if applicable
+        // copy "Checksum"
+        // remove/ignore "STOP" (2 bytes)
+        // return resulting size of array
+        uint8_t read_idx_u8 = 2U; // skip/remove/ignore "START"-bytes
+        uint8_t write_idx_u8 = 0U;
+
+        // copy "COMAND" and "SIZE"
+        while (read_idx_u8 < 5U)
+        {
+          rxBuffer[write_idx_u8] = rxBuffer[read_idx_u8];
+          read_idx_u8++;
+          write_idx_u8++;
+        }
+
+        // copy "DATA" while removing doubled 0x07 in data area if applicable
+        while (((write_idx_u8 - 3U) < rxBuffer[2]) && (read_idx_u8 < size - 2))
+        {
+          rxBuffer[write_idx_u8] = rxBuffer[read_idx_u8];
+          if ((rxBuffer[read_idx_u8] == 0x07U) && (rxBuffer[read_idx_u8 + 1U] == 0x07U))
+          {
+            // skip next byte which is expected to be 0x07 according to reverse
+            // engineered protocol
+            read_idx_u8++;
+          }
+          read_idx_u8++;
+          write_idx_u8++;
+        }
+
+        // copy "Checksum"
+        rxBuffer[write_idx_u8] = rxBuffer[read_idx_u8];
+        // return resulting size of array
+        return (write_idx_u8);
+      }
+
+      void parseRxMessage_(uint8_t *message_au8)
       {
         status_clear_warning();
-        uint8_t *msg = &data_[COMMAND_LEN_HEAD];
+        // message_au8[0] = 0x00
+        // message_au8[1] = command byte
+        // message_au8[2] = data_length
+        // message_au8[3] = first byte of data
 
-        switch (data_[COMMAND_IDX_MSG_ID])
-        {
-        case RES_GET_BOOTLOADER_VERSION:
-          memcpy(bootloader_version_, msg, data_[COMMAND_IDX_DATA]);
-          break;
-        case RES_GET_FIRMWARE_VERSION:
-          memcpy(firmware_version_, msg, data_[COMMAND_IDX_DATA]);
-          break;
-        case RES_GET_CONNECTOR_BOARD_VERSION:
-          memcpy(connector_board_version_, msg, data_[COMMAND_IDX_DATA]);
-          break;
-        case RES_GET_FAN_STATUS:
-        {
-          if (intake_fan_speed != nullptr)
-          {
-            intake_fan_speed->publish_state(msg[0]);
-          }
-          if (exhaust_fan_speed != nullptr)
-          {
-            exhaust_fan_speed->publish_state(msg[1]);
-          }
-          if (intake_fan_speed_rpm != nullptr)
-          {
-            intake_fan_speed_rpm->publish_state(static_cast<int>(1875000.0f / get_uint16_(2)));
-          }
-          if (exhaust_fan_speed_rpm != nullptr)
-          {
-            exhaust_fan_speed_rpm->publish_state(static_cast<int>(1875000.0f / get_uint16_(4)));
-          }
-          break;
-        }
-        case RES_GET_VALVE_STATUS:
-        {
-          if (bypass_valve != nullptr)
-          {
-            bypass_valve->publish_state(msg[0]);
-          }
-          if (bypass_valve_open != nullptr)
-          {
-            bypass_valve_open->publish_state(msg[0] != 0);
-          }
-          if (preheating_state != nullptr)
-          {
-            preheating_state->publish_state(msg[1] != 0);
-          }
-          if (motor_current_bypass != nullptr)
-          {
-            motor_current_bypass->publish_state(msg[2]);
-          }
-          if (motor_current_preheating != nullptr)
-          {
-            motor_current_preheating->publish_state(msg[3]);
-          }
-          break;
-        }
-        case RES_GET_BYPASS_CONTROL_STATUS:
-        {
-          if (bypass_factor != nullptr)
-          {
-            bypass_factor->publish_state(msg[2]);
-          }
-          if (bypass_step != nullptr)
-          {
-            bypass_step->publish_state(msg[3]);
-          }
-          if (bypass_correction != nullptr)
-          {
-            bypass_correction->publish_state(msg[4]);
-          }
-          if (summer_mode != nullptr)
-          {
-            summer_mode->publish_state(msg[6] != 0);
-          }
-          break;
-        }
-        case RES_GET_TEMPERATURE_STATUS:
-        {
+        uint8_t msg_command_u8 = message_au8[COMMAND_IDX_MSG_ID - 2]; // -2 because prefix is removed from data
+        uint8_t msg_length_u8  = message_au8[COMMAND_IDX_PROTOCOL_LENGTH - 2];
+        uint8_t *msg_data      = &message_au8[COMMAND_IDX_PROTOCOL_DATA_AREA - 2];
 
-          // T1 / outside air
-          if (outside_air_temperature != nullptr)
-          {
-            outside_air_temperature->publish_state((float)msg[0] / 2.0f - 20.0f);
-          }
-          // T2 / supply air
-          if (supply_air_temperature != nullptr)
-          {
-            supply_air_temperature->publish_state((float)msg[1] / 2.0f - 20.0f);
-          }
-          // T3 / return air
-          if (return_air_temperature != nullptr)
-          {
-            return_air_temperature->publish_state((float)msg[2] / 2.0f - 20.0f);
-          }
-          // T4 / exhaust air
-          if (exhaust_air_temperature != nullptr)
-          {
-            exhaust_air_temperature->publish_state((float)msg[3] / 2.0f - 20.0f);
-          }
-          break;
-        }
-        case RES_GET_SENSOR_DATA:
-        {
-
-          if (enthalpy_temperature != nullptr)
-          {
-            enthalpy_temperature->publish_state((float)msg[0] / 2.0f - 20.0f);
-          }
-
-          break;
-        }
-        case RES_GET_VENTILATION_LEVEL:
-        {
-
-          ESP_LOGD(TAG, "Level %02x", msg[8]);
-
-          if (return_air_level != nullptr)
-          {
-            return_air_level->publish_state(msg[6]);
-          }
-          if (supply_air_level != nullptr)
-          {
-            supply_air_level->publish_state(msg[7]);
-          }
-
-          if (ventilation_level != nullptr)
-          {
-            ventilation_level->publish_state(msg[8] - 1);
-          }
-
-          // Fan Speed
-          switch (msg[8])
-          {
-          case 0x00:
-            fan_mode.reset();
-            mode = climate::CLIMATE_MODE_FAN_ONLY;
+        switch (msg_command_u8) {
+          case RES_GET_BOOTLOADER_VERSION:
+            memcpy(bootloader_version_, msg_data, msg_length_u8);
             break;
-          case 0x01:
-            fan_mode = climate::CLIMATE_FAN_OFF;
-            mode = climate::CLIMATE_MODE_OFF;
+          case RES_GET_FIRMWARE_VERSION:
+            memcpy(firmware_version_, msg_data, msg_length_u8);
             break;
-          case 0x02:
-            fan_mode = climate::CLIMATE_FAN_LOW;
-            mode = climate::CLIMATE_MODE_FAN_ONLY;
+          case RES_GET_CONNECTOR_BOARD_VERSION:
+            memcpy(connector_board_version_, msg_data, msg_length_u8);
             break;
-          case 0x03:
-            fan_mode = climate::CLIMATE_FAN_MEDIUM;
-            mode = climate::CLIMATE_MODE_FAN_ONLY;
-            break;
-          case 0x04:
-            fan_mode = climate::CLIMATE_FAN_HIGH;
-            mode = climate::CLIMATE_MODE_FAN_ONLY;
-            break;
-          }
-
-          publish_state();
-
-          // Supply air fan active (1 = active / 0 = inactive)
-          if (supply_fan_active != nullptr)
+          case RES_GET_FAN_STATUS:
           {
-            supply_fan_active->publish_state(msg[9] == 1);
-          }
-          break;
-        }
-        case RES_GET_FAULTS:
-        {
-          if (filter_status != nullptr)
-          {
-            uint8_t status = msg[8];
-            filter_status->publish_state(status == 0 ? "Ok" : (status == 1 ? "Full" : "Unknown"));
-          }
-          break;
-        }
-        case RES_GET_TEMPERATURES:
-        {
-
-          // comfort temperature
-          target_temperature = (float)msg[0] / 2.0f - 20.0f;
-          publish_state();
-
-          // T1 / outside air
-          if (outside_air_temperature != nullptr && msg[5] & 0x01)
-          {
-            outside_air_temperature->publish_state((float)msg[1] / 2.0f - 20.0f);
-          }
-          // T2 / supply air
-          if (supply_air_temperature != nullptr && msg[5] & 0x02)
-          {
-            supply_air_temperature->publish_state((float)msg[2] / 2.0f - 20.0f);
-          }
-          // T3 / exhaust air
-          if (return_air_temperature != nullptr && msg[5] & 0x04)
-          {
-            return_air_temperature->publish_state((float)msg[3] / 2.0f - 20.0f);
-            current_temperature = (float)msg[3] / 2.0f - 20.0f;
-          }
-          // T4 / continued air
-          if (exhaust_air_temperature != nullptr && msg[5] & 0x08)
-          {
-            exhaust_air_temperature->publish_state((float)msg[4] / 2.0f - 20.0f);
-          }
-          // EWT
-          if (ewt_temperature != nullptr && msg[5] & 0x10)
-          {
-            ewt_temperature->publish_state((float)msg[6] / 2.0f - 20.0f);
-          }
-          // reheating
-          if (reheating_temperature != nullptr && msg[5] & 0x20)
-          {
-            reheating_temperature->publish_state((float)msg[7] / 2.0f - 20.0f);
-          }
-          // kitchen hood
-          if (kitchen_hood_temperature != nullptr && msg[5] & 0x40)
-          {
-            kitchen_hood_temperature->publish_state((float)msg[8] / 2.0f - 20.0f);
-          }
-
-          break;
-        }
-        case RES_GET_STATUS:
-        {
-          if (preheating_present != nullptr)
-          {
-            preheating_present->publish_state(msg[0]);
-          }
-
-          if (bypass_present != nullptr)
-          {
-            bypass_present->publish_state(msg[1]);
-          }
-
-          if (type != nullptr)
-          {
-            type->publish_state(msg[2] == 1 ? "Left" : (msg[2] == 2 ? "Right" : "Unknown"));
-          }
-
-          publish_size_entities_(msg[3]);
-
-          if (options_present != nullptr)
-          {
-            options_present->publish_state(msg[4]);
-          }
-
-          if (fireplace_present != nullptr)
-          {
-            fireplace_present->publish_state(msg[4] & 0x01);
-          }
-
-          if (kitchen_hood_present != nullptr)
-          {
-            kitchen_hood_present->publish_state(msg[4] & 0x02);
-          }
-
-          if (postheating_present != nullptr)
-          {
-            postheating_present->publish_state(msg[4] & 0x04);
-          }
-
-          if (postheating_pwm_mode_present != nullptr)
-          {
-            postheating_pwm_mode_present->publish_state(msg[4] & 0x40);
-          }
-
-          if (p10_active != nullptr)
-          {
-            p10_active->publish_state(msg[6] & 0x01);
-          }
-
-          if (p11_active != nullptr)
-          {
-            p11_active->publish_state(msg[6] & 0x02);
-          }
-
-          if (p12_active != nullptr)
-          {
-            p12_active->publish_state(msg[6] & 0x04);
-          }
-
-          if (p13_active != nullptr)
-          {
-            p13_active->publish_state(msg[6] & 0x08);
-          }
-
-          if (p14_active != nullptr)
-          {
-            p14_active->publish_state(msg[6] & 0x10);
-          }
-
-          if (p15_active != nullptr)
-          {
-            p15_active->publish_state(msg[6] & 0x20);
-          }
-
-          if (p16_active != nullptr)
-          {
-            p16_active->publish_state(msg[6] & 0x40);
-          }
-
-          if (p17_active != nullptr)
-          {
-            p17_active->publish_state(msg[6] & 0x80);
-          }
-
-          if (p18_active != nullptr)
-          {
-            p18_active->publish_state(msg[7] & 0x01);
-          }
-
-          if (p19_active != nullptr)
-          {
-            p19_active->publish_state(msg[7] & 0x02);
-          }
-
-          if (p90_active != nullptr)
-          {
-            p90_active->publish_state(msg[8] & 0x01);
-          }
-
-          if (p91_active != nullptr)
-          {
-            p91_active->publish_state(msg[8] & 0x02);
-          }
-
-          if (p92_active != nullptr)
-          {
-            p92_active->publish_state(msg[8] & 0x04);
-          }
-
-          if (p93_active != nullptr)
-          {
-            p93_active->publish_state(msg[8] & 0x08);
-          }
-
-          if (p94_active != nullptr)
-          {
-            p94_active->publish_state(msg[8] & 0x10);
-          }
-
-          if (p95_active != nullptr)
-          {
-            p95_active->publish_state(msg[8] & 0x20);
-          }
-
-          if (p96_active != nullptr)
-          {
-            p96_active->publish_state(msg[8] & 0x40);
-          }
-
-          if (p97_active != nullptr)
-          {
-            p97_active->publish_state(msg[8] & 0x80);
-          }
-
-          if (enthalpy_present != nullptr)
-          {
-            enthalpy_present->publish_state(msg[9]);
-          }
-
-          if (ewt_present != nullptr)
-          {
-            ewt_present->publish_state(msg[10]);
-          }
-
-          if (data_[COMMAND_IDX_DATA] >= 11)
-          {
-            status_payload_[0] = msg[0];
-            status_payload_[1] = msg[1];
-            status_payload_[2] = msg[2];
-            status_payload_[3] = msg[3];
-            status_payload_[4] = msg[4];
-            status_payload_[5] = msg[5];
-            status_payload_[6] = msg[9];
-            status_payload_[7] = msg[10];
-            status_payload_valid_ = true;
-          }
-          else
-          {
-            status_payload_valid_ = false;
-          }
-          break;
-        }
-        case RES_GET_OPERATION_HOURS:
-        {
-          if (level0_hours != nullptr)
-          {
-            level0_hours->publish_state((msg[0] << 16) | (msg[1] << 8) | msg[2]);
-          }
-
-          if (level1_hours != nullptr)
-          {
-            level1_hours->publish_state((msg[3] << 16) | (msg[4] << 8) | msg[5]);
-          }
-
-          if (level2_hours != nullptr)
-          {
-            level2_hours->publish_state((msg[6] << 16) | (msg[7] << 8) | msg[8]);
-          }
-
-          if (level3_hours != nullptr)
-          {
-            level3_hours->publish_state((msg[17] << 16) | (msg[18] << 8) | msg[19]);
-          }
-
-          if (frost_protection_hours != nullptr)
-          {
-            frost_protection_hours->publish_state((msg[9] << 8) | msg[10]);
-          }
-
-          if (bypass_open_hours != nullptr)
-          {
-            bypass_open_hours->publish_state((msg[13] << 8) | msg[14]);
-          }
-
-          if (preheating_hours != nullptr)
-          {
-            preheating_hours->publish_state((msg[11] << 8) | msg[12]);
-          }
-
-          if (filter_hours != nullptr)
-          {
-            filter_hours->publish_state((msg[15] << 8) | msg[16]);
-          }
-          break;
-        }
-
-        case RES_GET_PREHEATING_STATUS:
-        {
-          if (preheating_valve != nullptr)
-          {
-            std::string name_preheating_valve;
-            switch (msg[0])
+            if (intake_fan_speed != nullptr)
             {
-            case 0:
-              name_preheating_valve = "Closed";
-              break;
-
-            case 1:
-              name_preheating_valve = "Open";
-              break;
-
-            default:
-              name_preheating_valve = "Unknown";
-              break;
+              intake_fan_speed->publish_state(msg_data[0]);
             }
-            preheating_valve->publish_state(name_preheating_valve);
-          }
-
-          if (frost_protection_active != nullptr)
-          {
-            frost_protection_active->publish_state(msg[1] != 0);
-          }
-
-          if (preheating_state != nullptr)
-          {
-            preheating_state->publish_state(msg[2] != 0);
-          }
-
-          if (frost_protection_minutes != nullptr)
-          {
-            frost_protection_minutes->publish_state((msg[3] << 8) | msg[4]);
-          }
-
-          if (frost_protection_level != nullptr)
-          {
-            std::string name_frost_protection_level;
-            switch (msg[5])
+            if (exhaust_fan_speed != nullptr)
             {
-            case 0:
-              name_frost_protection_level = "GuaranteedProtection";
-              break;
-
-            case 1:
-              name_frost_protection_level = "HighProtection";
-              break;
-
-            case 2:
-              name_frost_protection_level = "NominalProtection";
-              break;
-
-            case 3:
-              name_frost_protection_level = "Economy";
-              break;
-
-            default:
-              name_frost_protection_level = "Unknown";
-              break;
+              exhaust_fan_speed->publish_state(msg_data[1]);
             }
-            frost_protection_level->publish_state(name_frost_protection_level);
+            if (intake_fan_speed_rpm != nullptr)
+            {
+              intake_fan_speed_rpm->publish_state(static_cast<int>(1875000.0f / (uint16_t)(msg_data[2] << 8 | msg_data[3]))); // get_uint16_(2));
+            }
+            if (exhaust_fan_speed_rpm != nullptr)
+            {
+              exhaust_fan_speed_rpm->publish_state(static_cast<int>(1875000.0f / (uint16_t)(msg_data[4] << 8 | msg_data[5]))); // get_uint16_(4));
+            }
+            break;
           }
-          break;
-        }
-        case RES_GET_TIME_DELAY:
-        {
-          if (bathroom_switch_on_delay_minutes != nullptr)
+          case RES_GET_VALVE_STATUS:
           {
-            bathroom_switch_on_delay_minutes->publish_state(msg[0]);
+            if (bypass_valve != nullptr)
+            {
+              bypass_valve->publish_state(msg_data[0]);
+            }
+            if (bypass_valve_open != nullptr)
+            {
+              bypass_valve_open->publish_state(msg_data[0] != 0);
+            }
+            if (preheating_state != nullptr)
+            {
+              preheating_state->publish_state(msg_data[1] != 0);
+            }
+            if (motor_current_bypass != nullptr)
+            {
+              motor_current_bypass->publish_state(msg_data[2]);
+            }
+            if (motor_current_preheating != nullptr)
+            {
+              motor_current_preheating->publish_state(msg_data[3]);
+            }
+            break;
           }
-
-          if (bathroom_switch_off_delay_minutes != nullptr)
+          case RES_GET_BYPASS_CONTROL_STATUS:
           {
-            bathroom_switch_off_delay_minutes->publish_state(msg[1]);
+            if (bypass_factor != nullptr)
+            {
+              bypass_factor->publish_state(msg_data[2]);
+            }
+            if (bypass_step != nullptr)
+            {
+              bypass_step->publish_state(msg_data[3]);
+            }
+            if (bypass_correction != nullptr)
+            {
+              bypass_correction->publish_state(msg_data[4]);
+            }
+            if (summer_mode != nullptr)
+            {
+              summer_mode->publish_state(msg_data[6] != 0);
+            }
+            break;
           }
-
-          if (l1_switch_off_delay_minutes != nullptr)
+          case RES_GET_TEMPERATURE_STATUS:
           {
-            l1_switch_off_delay_minutes->publish_state(msg[2]);
+            // T1 / outside air
+            if (outside_air_temperature != nullptr)
+            {
+              outside_air_temperature->publish_state((float) msg_data[0] / 2.0f - 20.0f);
+            }
+            // T2 / supply air
+            if (supply_air_temperature != nullptr)
+            {
+              supply_air_temperature->publish_state((float) msg_data[1] / 2.0f - 20.0f);
+            }
+            // T3 / return air
+            if (return_air_temperature != nullptr)
+            {
+              return_air_temperature->publish_state((float) msg_data[2] / 2.0f - 20.0f);
+            }
+            // T4 / exhaust air
+            if (exhaust_air_temperature != nullptr)
+            {
+              exhaust_air_temperature->publish_state((float) msg_data[3] / 2.0f - 20.0f);
+            }
+            break;
           }
-
-          if (boost_ventilation_minutes != nullptr)
+          case RES_GET_SENSOR_DATA:
           {
-            boost_ventilation_minutes->publish_state(msg[3]);
+            if (enthalpy_temperature != nullptr)
+            {
+              enthalpy_temperature->publish_state((float) msg_data[0] / 2.0f - 20.0f);
+            }
+            break;
           }
-
-          if (filter_warning_weeks != nullptr)
+          case RES_GET_VENTILATION_LEVEL:
           {
-            filter_warning_weeks->publish_state(msg[4]);
-          }
+            ESP_LOGD(TAG, "Level %02X", msg_data[8]);
+            ESP_LOGV(TAG, "Off ab %i - Off zu %i - Low ab %i - Low zu %i - Middle ab %i - Middle zu %i - High ab %i - High zu %i", msg_data[0], msg_data[3], msg_data[1], msg_data[4], msg_data[2], msg_data[5], msg_data[10], msg_data[11]);
 
-          if (rf_high_time_short_minutes != nullptr)
+            if (return_air_level != nullptr)
+            {
+              return_air_level->publish_state(msg_data[6]);
+            }
+            if (supply_air_level != nullptr)
+            {
+              supply_air_level->publish_state(msg_data[7]);
+            }
+
+            if (ventilation_level != nullptr)
+            {
+              ventilation_level->publish_state(msg_data[8] - 1);
+            }
+
+            // Fan Speed
+            switch(msg_data[8])
+            {
+              case 0x00:
+                fan_mode.reset();
+                mode = climate::CLIMATE_MODE_FAN_ONLY;
+                break;
+              case 0x01:
+                fan_mode = climate::CLIMATE_FAN_OFF;
+                mode = climate::CLIMATE_MODE_OFF;
+                break;
+              case 0x02:
+                fan_mode = climate::CLIMATE_FAN_LOW;
+                mode = climate::CLIMATE_MODE_FAN_ONLY;
+                break;
+              case 0x03:
+                fan_mode = climate::CLIMATE_FAN_MEDIUM;
+                mode = climate::CLIMATE_MODE_FAN_ONLY;
+              break;
+              case 0x04:
+                fan_mode = climate::CLIMATE_FAN_HIGH;
+                mode = climate::CLIMATE_MODE_FAN_ONLY;
+                break;
+            }
+
+            publish_state();
+
+            // Supply air fan active (1 = active / 0 = inactive)
+            if (supply_fan_active != nullptr)
+            {
+              supply_fan_active->publish_state(msg_data[9] == 1);
+            }
+            break;
+          }
+          case RES_GET_FAULTS:
           {
-            rf_high_time_short_minutes->publish_state(msg[5]);
+            if (filter_status != nullptr)
+            {
+              uint8_t status = msg_data[8];
+              filter_status->publish_state(status == 0 ? "Ok" : (status == 1 ? "Full" : "Unknown"));
+            }
+            break;
           }
-
-          if (rf_high_time_long_minutes != nullptr)
+          case RES_GET_TEMPERATURES:
           {
-            rf_high_time_long_minutes->publish_state(msg[6]);
-          }
+            // comfort temperature
+            target_temperature = (float) msg_data[0] / 2.0f - 20.0f;
+            publish_state();
 
-          if (extractor_hood_switch_off_delay_minutes != nullptr)
+            // T1 / outside air
+            if (outside_air_temperature != nullptr && msg_data[5] & 0x01)
+            {
+              outside_air_temperature->publish_state((float) msg_data[1] / 2.0f - 20.0f);
+            }
+            // T2 / supply air
+            if (supply_air_temperature != nullptr && msg_data[5] & 0x02)
+            {
+              supply_air_temperature->publish_state((float) msg_data[2] / 2.0f - 20.0f);
+            }
+            // T3 / exhaust air
+            if (return_air_temperature != nullptr && msg_data[5] & 0x04)
+            {
+              return_air_temperature->publish_state((float) msg_data[3] / 2.0f - 20.0f);
+              current_temperature = (float) msg_data[3] / 2.0f - 20.0f;
+            }
+            // T4 / continued air
+            if (exhaust_air_temperature != nullptr && msg_data[5] & 0x08)
+            {
+              exhaust_air_temperature->publish_state((float) msg_data[4] / 2.0f - 20.0f);
+            }
+            // EWT
+            if (ewt_temperature != nullptr && msg_data[5] & 0x10)
+            {
+              ewt_temperature->publish_state((float) msg_data[6] / 2.0f - 20.0f);
+            }
+            // reheating
+            if (reheating_temperature != nullptr && msg_data[5] & 0x20)
+            {
+              reheating_temperature->publish_state((float) msg_data[7] / 2.0f - 20.0f);
+            }
+            // kitchen hood
+            if (kitchen_hood_temperature != nullptr && msg_data[5] & 0x40)
+            {
+              kitchen_hood_temperature->publish_state((float) msg_data[8] / 2.0f - 20.0f);
+            }
+            break;
+          }
+          case RES_GET_STATUS:
           {
-            extractor_hood_switch_off_delay_minutes->publish_state(msg[7]);
-          }
+            if (preheating_present != nullptr)
+            {
+              preheating_present->publish_state(msg_data[0]);
+            }
 
-          break;
-        }
+            if (bypass_present != nullptr)
+            {
+              bypass_present->publish_state(msg_data[1]);
+            }
+
+            if (type != nullptr)
+            {
+              type->publish_state(msg_data[2] == 1 ? "Left" : (msg_data[2] == 2 ? "Right" : "Unknown"));
+            }
+
+            publish_size_entities_(msg_data[3]);
+
+            if (options_present != nullptr)
+            {
+              options_present->publish_state(msg_data[4]);
+            }
+
+            if (fireplace_present != nullptr)
+            {
+              fireplace_present->publish_state(msg_data[4] & 0x01);
+            }
+
+            if (kitchen_hood_present != nullptr)
+            {
+              kitchen_hood_present->publish_state(msg_data[4] & 0x02);
+            }
+
+            if (postheating_present != nullptr)
+            {
+              postheating_present->publish_state(msg_data[4] & 0x04);
+            }
+
+            if (postheating_pwm_mode_present != nullptr)
+            {
+              postheating_pwm_mode_present->publish_state(msg_data[4] & 0x40);
+            }
+
+            if (p10_active != nullptr)
+            {
+              p10_active->publish_state(msg_data[6] & 0x01);
+            }
+
+            if (p11_active != nullptr)
+            {
+              p11_active->publish_state(msg_data[6] & 0x02);
+            }
+
+            if (p12_active != nullptr)
+            {
+              p12_active->publish_state(msg_data[6] & 0x04);
+            }
+
+            if (p13_active != nullptr)
+            {
+              p13_active->publish_state(msg_data[6] & 0x08);
+            }
+
+            if (p14_active != nullptr)
+            {
+              p14_active->publish_state(msg_data[6] & 0x10);
+            }
+
+            if (p15_active != nullptr)
+            {
+              p15_active->publish_state(msg_data[6] & 0x20);
+            }
+
+            if (p16_active != nullptr)
+            {
+              p16_active->publish_state(msg_data[6] & 0x40);
+            }
+
+            if (p17_active != nullptr)
+            {
+              p17_active->publish_state(msg_data[6] & 0x80);
+            }
+
+            if (p18_active != nullptr)
+            {
+              p18_active->publish_state(msg_data[7] & 0x01);
+            }
+
+            if (p19_active != nullptr)
+            {
+              p19_active->publish_state(msg_data[7] & 0x02);
+            }
+
+            if (p90_active != nullptr)
+            {
+              p90_active->publish_state(msg_data[8] & 0x01);
+            }
+
+            if (p91_active != nullptr)
+            {
+              p91_active->publish_state(msg_data[8] & 0x02);
+            }
+
+            if (p92_active != nullptr)
+            {
+              p92_active->publish_state(msg_data[8] & 0x04);
+            }
+
+            if (p93_active != nullptr)
+            {
+              p93_active->publish_state(msg_data[8] & 0x08);
+            }
+
+            if (p94_active != nullptr)
+            {
+              p94_active->publish_state(msg_data[8] & 0x10);
+            }
+
+            if (p95_active != nullptr)
+            {
+              p95_active->publish_state(msg_data[8] & 0x20);
+            }
+
+            if (p96_active != nullptr)
+            {
+              p96_active->publish_state(msg_data[8] & 0x40);
+            }
+
+            if (p97_active != nullptr)
+            {
+              p97_active->publish_state(msg_data[8] & 0x80);
+            }
+
+            if (enthalpy_present != nullptr)
+            {
+              enthalpy_present->publish_state(msg_data[9]);
+            }
+
+            if (ewt_present != nullptr)
+            {
+              ewt_present->publish_state(msg_data[10]);
+            }
+
+            if (msg_length_u8 >= 11)
+            {
+              status_payload_[0] = msg_data[0];
+              status_payload_[1] = msg_data[1];
+              status_payload_[2] = msg_data[2];
+              status_payload_[3] = msg_data[3];
+              status_payload_[4] = msg_data[4];
+              status_payload_[5] = msg_data[5];
+              status_payload_[6] = msg_data[9];
+              status_payload_[7] = msg_data[10];
+              status_payload_valid_ = true;
+            }
+            else
+            {
+              status_payload_valid_ = false;
+            }
+            break;
+          }
+          case RES_GET_OPERATION_HOURS:
+          {
+            if (level0_hours != nullptr)
+            {
+              level0_hours->publish_state((msg_data[0] << 16) | (msg_data[1] << 8) | msg_data[2]);
+            }
+
+            if (level1_hours != nullptr)
+            {
+              level1_hours->publish_state((msg_data[3] << 16) | (msg_data[4] << 8) | msg_data[5]);
+            }
+
+            if (level2_hours != nullptr)
+            {
+              level2_hours->publish_state((msg_data[6] << 16) | (msg_data[7] << 8) | msg_data[8]);
+            }
+
+            if (level3_hours != nullptr)
+            {
+              level3_hours->publish_state((msg_data[17] << 16) | (msg_data[18] << 8) | msg_data[19]);
+            }
+
+            if (frost_protection_hours != nullptr)
+            {
+              frost_protection_hours->publish_state((msg_data[9] << 8) | msg_data[10]);
+            }
+
+            if (bypass_open_hours != nullptr)
+            {
+              bypass_open_hours->publish_state((msg_data[13] << 8) | msg_data[14]);
+            }
+
+            if (preheating_hours != nullptr)
+            {
+              preheating_hours->publish_state((msg_data[11] << 8) | msg_data[12]);
+            }
+
+            if (filter_hours != nullptr)
+            {
+              filter_hours->publish_state((msg_data[15] << 8) | msg_data[16]);
+            }
+            break;
+          }
+          case RES_GET_PREHEATING_STATUS:
+          {
+            if (preheating_valve != nullptr)
+            {
+              std::string name_preheating_valve;
+              switch (msg_data[0])
+              {
+              case 0:
+                name_preheating_valve = "Closed";
+                break;
+
+              case 1:
+                name_preheating_valve = "Open";
+                break;
+
+              default:
+                name_preheating_valve = "Unknown";
+                break;
+              }
+              preheating_valve->publish_state(name_preheating_valve);
+            }
+
+            if (frost_protection_active != nullptr)
+            {
+              frost_protection_active->publish_state(msg_data[1] != 0);
+            }
+
+            if (preheating_state != nullptr)
+            {
+              preheating_state->publish_state(msg_data[2] != 0);
+            }
+
+            if (frost_protection_minutes != nullptr)
+            {
+              frost_protection_minutes->publish_state((msg_data[3] << 8) | msg_data[4]);
+            }
+
+            if (frost_protection_level != nullptr)
+            {
+              std::string name_frost_protection_level;
+              switch (msg_data[5])
+              {
+              case 0:
+                name_frost_protection_level = "GuaranteedProtection";
+                break;
+
+              case 1:
+                name_frost_protection_level = "HighProtection";
+                break;
+
+              case 2:
+                name_frost_protection_level = "NominalProtection";
+                break;
+
+              case 3:
+                name_frost_protection_level = "Economy";
+                break;
+
+              default:
+                name_frost_protection_level = "Unknown";
+                break;
+              }
+              frost_protection_level->publish_state(name_frost_protection_level);
+            }
+            break;
+          }
+          case RES_GET_TIME_DELAY:
+          {
+            if (bathroom_switch_on_delay_minutes != nullptr)
+            {
+              bathroom_switch_on_delay_minutes->publish_state(msg_data[0]);
+            }
+
+            if (bathroom_switch_off_delay_minutes != nullptr)
+            {
+              bathroom_switch_off_delay_minutes->publish_state(msg_data[1]);
+            }
+
+            if (l1_switch_off_delay_minutes != nullptr)
+            {
+              l1_switch_off_delay_minutes->publish_state(msg_data[2]);
+            }
+
+            if (boost_ventilation_minutes != nullptr)
+            {
+              boost_ventilation_minutes->publish_state(msg_data[3]);
+            }
+
+            if (filter_warning_weeks != nullptr)
+            {
+              filter_warning_weeks->publish_state(msg_data[4]);
+            }
+
+            if (rf_high_time_short_minutes != nullptr)
+            {
+              rf_high_time_short_minutes->publish_state(msg_data[5]);
+            }
+
+            if (rf_high_time_long_minutes != nullptr)
+            {
+              rf_high_time_long_minutes->publish_state(msg_data[6]);
+            }
+
+            if (extractor_hood_switch_off_delay_minutes != nullptr)
+            {
+              extractor_hood_switch_off_delay_minutes->publish_state(msg_data[7]);
+            }
+            break;
+          }
         }
       }
 
+      // --- getter ---
+      
       void get_fan_status_()
       {
         if (intake_fan_speed != nullptr ||
@@ -1031,24 +1257,13 @@ namespace esphome
         write_command_(CMD_GET_TIME_DELAY, nullptr, 0);
       }
 
-      uint8_t get_uint8_t_(uint8_t start_index) const
-      {
-        return data_[COMMAND_LEN_HEAD + start_index];
-      }
-
-      uint16_t get_uint16_(uint8_t start_index) const
-      {
-        return (uint16_t(data_[COMMAND_LEN_HEAD + start_index + 1] | data_[COMMAND_LEN_HEAD + start_index] << 8));
-      }
-
       void publish_size_entities_(uint8_t raw_size);
       const char *unit_size_text_label_(uint8_t raw_size) const;
       const char *unit_size_option_label_(uint8_t raw_size) const;
 
-      uint8_t data_[30];
-      uint8_t data_index_{0};
-      int8_t update_counter_{-4};
-      const int8_t num_update_counter_elements_{9};
+      uint8_t caRxBuffer_au8[MAX_MESSAGE_SIZE];
+      uint8_t caRxIdx_u8 = 0;
+      int8_t update_counter_{-10};
       uint8_t status_payload_[8]{0};
       bool status_payload_valid_{false};
       uint8_t current_unit_size_{0};
@@ -1135,6 +1350,8 @@ namespace esphome
       sensor::Sensor *rf_high_time_short_minutes{nullptr};
       sensor::Sensor *rf_high_time_long_minutes{nullptr};
       sensor::Sensor *extractor_hood_switch_off_delay_minutes{nullptr};
+
+      // public functions
 
       void set_type(text_sensor::TextSensor *type) { this->type = type; };
       void set_size(text_sensor::TextSensor *size) { this->size = size; };
