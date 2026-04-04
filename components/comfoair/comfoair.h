@@ -313,7 +313,7 @@ namespace esphome
     protected:
 
       // --- setter ---
-      
+
       void reset_errors_(bool filters, bool errors)
       {
         uint8_t reset_cmd[CMD_RESET_AND_SELF_TEST_LENGTH] = {errors ? (uint8_t)1 : (uint8_t)0, 0, 0, filters ? (uint8_t)1 : (uint8_t)0};
@@ -352,7 +352,7 @@ namespace esphome
       }
 
       // --- TX functions ---
-      
+
       // Build TX-array
       void write_command_(const uint8_t command, const uint8_t *command_data, uint8_t command_data_length)
       {
@@ -412,7 +412,7 @@ namespace esphome
         idx_txBuffer_u8++;
         txBuffer_au8[idx_txBuffer_u8] = 0x0F;
 
-        // todo for future use when ComfoAir and ComfoSense are both 
+        // todo for future use when ComfoAir and ComfoSense are both
         // connected to an individual UART on this ESP32:
         // Either send to CA or CS
         //
@@ -498,7 +498,7 @@ namespace esphome
       }
 
       // --- RX functions ---
-      
+
       rx_status checkRx_(uint8_t rxBuffer[], uint8_t *index_u8, uint8_t rc)
       {
         /* Manage and analyze rx bytes.
@@ -1161,7 +1161,7 @@ namespace esphome
       }
 
       // --- getter ---
-      
+
       void get_fan_status_()
       {
         if (intake_fan_speed != nullptr ||
